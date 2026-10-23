@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 
 import numpy as np
@@ -13,6 +13,12 @@ class SpatialSlot(Enum):
     RIGHT_NEAR = "right_near"
     RIGHT_FAR = "right_far"
     TOP = "top"
+
+
+class DominantHand(Enum):
+    LEFT = "left"
+    RIGHT = "right"
+    BOTH = "both"
 
 
 class NMSType(Enum):
@@ -32,7 +38,7 @@ class HandLandmarks:
 
 @dataclass(frozen=True)
 class FaceLandmarks:
-    points: np.ndarray  # (468, 3)
+    points: np.ndarray  # (478, 3) — 468 mesh + 10 iris landmarks
 
 
 @dataclass(frozen=True)
@@ -43,10 +49,11 @@ class PoseLandmarks:
 @dataclass(frozen=True)
 class LandmarkFrame:
     timestamp_ms: int
-    hands: HandLandmarks
-    face: FaceLandmarks
-    pose: PoseLandmarks
+    hands: HandLandmarks          # normalized to signing space
+    face: FaceLandmarks           # normalized to signing space
+    pose: PoseLandmarks           # normalized to signing space
     hand_presence: tuple[bool, bool]
+    raw_hands: HandLandmarks | None = None  # raw [0,1] coords for display
 
 
 @dataclass(frozen=True)
@@ -61,7 +68,7 @@ class GlossToken:
     sign_id: str
     confidence: float
     temporal_span: tuple[int, int]
-    dominant_hand: str  # "left" | "right" | "both"
+    dominant_hand: DominantHand
     spatial_slot: SpatialSlot | None = None
     is_establishing: bool = False
     is_referencing: bool = False
@@ -85,7 +92,7 @@ class NMSSignal:
     intensity: float
 
 
-@dataclass
+@dataclass(frozen=True)
 class GlossSequence:
     tokens: list[GlossToken]
     nms_signals: list[NMSSignal]

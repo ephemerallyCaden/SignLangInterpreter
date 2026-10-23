@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 import time
+from typing import Any
 
-from src.core.models import GlossSequence, GlossToken, NMSType, TranslationResult
+from src.core.models import GlossSequence, NMSType, TranslationResult
 from src.ports.grammar_transformer import GrammarTransformer
 
-# Direct gloss → English word map (expanded as vocabulary grows)
 WORD_MAP: dict[str, str] = {
     "HELLO": "hello",
     "THANK_YOU": "thank you",
@@ -15,37 +15,41 @@ WORD_MAP: dict[str, str] = {
     "STORE": "store",
     "MOTHER": "mother",
     "FATHER": "father",
-    "FUTURE": "",  # tense marker, not a word
+    "FUTURE": "",
     "PAST": "",
-    "POINT": "",  # resolved via spatial context
+    "POINT": "",
     "UNKNOWN": "?",
 }
 
 
 class RuleBasedAdapter(GrammarTransformer):
-    """Hardcoded BSL → English reordering rules.
+    """Phase 1 BSL -> English rules.
 
-    Implements the 5 core rules from the project plan:
-    1. Topic-comment → SVO reordering
-    2. FUTURE/PAST → tense marking
-    3. NMS:QUESTION_YN → subject-auxiliary inversion
-    4. NMS:NEGATION → insert "not" before verb
-    5. POINT:slot → resolve from spatial context
+    Currently implements:
+    - Word-for-word gloss mapping (no reordering yet)
+    - NMS question marking (yes/no and wh -> '?')
+    - NMS negation ('not' inserted before verb or as standalone)
+    - Spatial reference resolution (POINT:slot -> referent from context)
+    - Tense markers (FUTURE/PAST) suppressed from output
+
+    Not yet implemented (Phase 2+):
+    - Topic-comment -> SVO reordering
+    - Actual tense transformation on verbs
     """
 
-    def transform(self, sequence: GlossSequence) -> TranslationResult:
+    def transform(
+        self, sequence: GlossSequence, context: dict[str, Any] | None = None
+    ) -> TranslationResult:
         start = time.perf_counter()
 
         words = self._glosses_to_words(sequence)
         text = " ".join(w for w in words if w)
 
-        # Apply NMS modifications
         text = self._apply_nms(text, sequence)
 
         if not text.strip():
             text = "..."
 
-        # Capitalize first letter, add period if missing punctuation
         text = text[0].upper() + text[1:] if text else text
         if text and text[-1] not in ".!?":
             text += "."
@@ -64,7 +68,6 @@ class RuleBasedAdapter(GrammarTransformer):
         words: list[str] = []
         for token in sequence.tokens:
             if token.is_referencing and token.spatial_slot:
-                # Resolve spatial reference
                 referent = sequence.spatial_context.get(token.spatial_slot)
                 if referent:
                     words.append(WORD_MAP.get(referent, referent.lower()))
@@ -77,19 +80,27 @@ class RuleBasedAdapter(GrammarTransformer):
         return words
 
     def _apply_nms(self, text: str, sequence: GlossSequence) -> str:
+        is_question = False
+        is_negated = False
+
         for nms in sequence.nms_signals:
-            if nms.signal_type == NMSType.QUESTION_YES_NO:
-                text = text.rstrip(".")
-                text += "?"
-            elif nms.signal_type == NMSType.QUESTION_WH:
-                text = text.rstrip(".")
-                text += "?"
+            if nms.signal_type in (NMSType.QUESTION_YES_NO, NMSType.QUESTION_WH):
+                is_question = True
             elif nms.signal_type == NMSType.NEGATION:
-                # Simple negation: prepend "not" (crude but functional)
-                words = text.split()
-                if len(words) > 1:
-                    words.insert(1, "not")
-                    text = " ".join(words)
+                is_negated = True
+
+        if is_negated:
+            words = text.split()
+            if len(words) >= 2:
+                words.insert(1, "not")
+            elif len(words) == 1:
+                words = ["not", words[0]]
+            text = " ".join(words)
+
+        if is_question:
+            text = text.rstrip(".")
+            text += "?"
+
         return text
 
     def _aggregate_confidence(self, sequence: GlossSequence) -> float:

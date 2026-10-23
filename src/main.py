@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import argparse
 import logging
-import sys
+import time
 
 import cv2
 
@@ -48,13 +48,13 @@ def main() -> None:
         stride_ms=config.pipeline.stride_ms,
     )
 
-    # Open resources
-    camera.open()
-    extractor.open()
-
-    log.info("Pipeline running. Press 'q' to quit.")
-
+    # Open resources inside try block so cleanup always runs
     try:
+        camera.open()
+        extractor.open()
+
+        log.info("Pipeline running. Press 'q' to quit.")
+
         while True:
             frame = camera.acquire_frame()
             if frame is None:
@@ -66,12 +66,17 @@ def main() -> None:
                 result = orchestrator.process_frame(landmarks)
                 if result is not None:
                     console.emit(result)
+                    overlay.emit(result)
 
             if config.show_overlay:
-                vis = overlay.draw_frame(frame, text=None)
+                vis = overlay.draw_frame(frame)
                 cv2.imshow("BSL Interpreter", vis)
                 if cv2.waitKey(1) & 0xFF == ord("q"):
                     break
+            else:
+                # Yield CPU when no GUI event loop
+                time.sleep(0.001)
+
     except KeyboardInterrupt:
         pass
     finally:

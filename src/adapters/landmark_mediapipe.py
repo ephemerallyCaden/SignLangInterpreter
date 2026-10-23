@@ -21,6 +21,8 @@ FaceLandmarkerOptions = mp.tasks.vision.FaceLandmarkerOptions
 FaceLandmarker = mp.tasks.vision.FaceLandmarker
 VisionRunningMode = mp.tasks.vision.RunningMode
 
+FACE_LANDMARK_COUNT = 478  # 468 mesh + 10 iris
+
 
 def _landmarks_to_array(landmark_list: list) -> np.ndarray:
     """Convert a MediaPipe landmark list to a (N, 3) numpy array."""
@@ -38,6 +40,8 @@ class MediaPipeCompositeAdapter(LandmarkExtractor):
         self._face_landmarker: FaceLandmarker | None = None
         self._last_latency_ms: float = 0.0
         self._frame_count = 0
+        self._last_origin: np.ndarray | None = None
+        self._last_shoulder_width: float | None = None
 
     def open(self) -> None:
         hand_model = str(self._models_dir / "hand_landmarker.task")
@@ -84,7 +88,7 @@ class MediaPipeCompositeAdapter(LandmarkExtractor):
         self._last_latency_ms = (time.perf_counter() - start) * 1000
         self._frame_count += 1
 
-        # Parse hands
+        # Parse hands (raw MediaPipe [0,1] coords)
         left_hand = None
         right_hand = None
         for i, handedness_list in enumerate(hand_result.handedness):
@@ -106,19 +110,26 @@ class MediaPipeCompositeAdapter(LandmarkExtractor):
         if face_result.face_landmarks:
             face_pts = _landmarks_to_array(face_result.face_landmarks[0])
         else:
-            face_pts = np.zeros((468, 3), dtype=np.float32)
+            face_pts = np.zeros((FACE_LANDMARK_COUNT, 3), dtype=np.float32)
 
-        # Normalize to signing space
-        hands, pose_pts = self._normalize(left_hand, right_hand, pose_pts)
+        # Keep raw hand coords for display before normalization
+        raw_hands = HandLandmarks(left=left_hand, right=right_hand)
 
-        timestamp_ms = int(self._frame_count * (1000 / 30))  # approximate
+        # Normalize all landmarks to signing space
+        norm_result = self._normalize(left_hand, right_hand, pose_pts, face_pts)
+        if norm_result is None:
+            return None  # skip frame if pose detection failed entirely
+
+        norm_hands, norm_pose, norm_face = norm_result
+        timestamp_ms = int(self._frame_count * (1000 / 30))
 
         return LandmarkFrame(
             timestamp_ms=timestamp_ms,
-            hands=hands,
-            face=FaceLandmarks(points=face_pts),
-            pose=PoseLandmarks(points=pose_pts),
+            hands=norm_hands,
+            face=FaceLandmarks(points=norm_face),
+            pose=PoseLandmarks(points=norm_pose),
             hand_presence=(left_hand is not None, right_hand is not None),
+            raw_hands=raw_hands,
         )
 
     def _normalize(
@@ -126,24 +137,37 @@ class MediaPipeCompositeAdapter(LandmarkExtractor):
         left_hand: np.ndarray | None,
         right_hand: np.ndarray | None,
         pose: np.ndarray,
-    ) -> tuple[HandLandmarks, np.ndarray]:
-        """Normalize to signing space: origin=sternum, scale=shoulder width."""
+        face: np.ndarray,
+    ) -> tuple[HandLandmarks, np.ndarray, np.ndarray] | None:
+        """Normalize to signing space: origin=sternum, scale=shoulder width.
+
+        All landmarks (hands, pose, face) are transformed to the same space.
+        When pose detection fails, carries forward the last known good reference.
+        Returns None only if no valid reference has ever been established.
+        """
         left_shoulder = pose[11]
         right_shoulder = pose[12]
-        origin = (left_shoulder + right_shoulder) / 2
         shoulder_width = float(np.linalg.norm(left_shoulder - right_shoulder))
 
-        if shoulder_width < 1e-6:
-            shoulder_width = 1.0  # fallback if pose detection failed
+        if shoulder_width > 1e-6:
+            origin = (left_shoulder + right_shoulder) / 2
+            self._last_origin = origin
+            self._last_shoulder_width = shoulder_width
+        elif self._last_origin is not None:
+            origin = self._last_origin
+            shoulder_width = self._last_shoulder_width  # type: ignore[assignment]
+        else:
+            return None  # no valid pose reference yet
 
         def shift_and_scale(pts: np.ndarray) -> np.ndarray:
             return (pts - origin) / shoulder_width
 
         norm_pose = shift_and_scale(pose)
+        norm_face = shift_and_scale(face)
         norm_left = shift_and_scale(left_hand) if left_hand is not None else None
         norm_right = shift_and_scale(right_hand) if right_hand is not None else None
 
-        return HandLandmarks(left=norm_left, right=norm_right), norm_pose
+        return HandLandmarks(left=norm_left, right=norm_right), norm_pose, norm_face
 
     def get_latency_ms(self) -> float:
         return self._last_latency_ms
