@@ -1,0 +1,9 @@
+camera:
+  index: 0
+
+pipeline:
+  window_size_ms: 1000
+  stride_ms: 500
+  max_queue_size: 3
+
+show_overlay: true
