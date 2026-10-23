@@ -9,6 +9,7 @@ import mediapipe as mp
 import numpy as np
 
 from src.core.models import FaceLandmarks, HandLandmarks, LandmarkFrame, PoseLandmarks
+from src.infrastructure.one_euro_filter import LandmarkSmoother
 from src.ports.landmark_extractor import LandmarkExtractor
 
 log = logging.getLogger(__name__)
@@ -22,17 +23,16 @@ FaceLandmarkerOptions = mp.tasks.vision.FaceLandmarkerOptions
 FaceLandmarker = mp.tasks.vision.FaceLandmarker
 VisionRunningMode = mp.tasks.vision.RunningMode
 
-FACE_LANDMARK_COUNT = 478  # 468 mesh + 10 iris
-SHOULDER_WIDTH_SMOOTHING = 0.7  # EMA alpha: higher = more smoothing
+FACE_LANDMARK_COUNT = 478
+SHOULDER_WIDTH_SMOOTHING = 0.7
 
 
 def _landmarks_to_array(landmark_list: list) -> np.ndarray:
-    """Convert a MediaPipe landmark list to a (N, 3) numpy array."""
     return np.array([[lm.x, lm.y, lm.z] for lm in landmark_list], dtype=np.float32)
 
 
 class MediaPipeCompositeAdapter(LandmarkExtractor):
-    """Runs Hand, Pose, and Face Landmarkers and merges results into a LandmarkFrame."""
+    """Runs Hand, Pose, and Face Landmarkers in VIDEO mode with landmark smoothing."""
 
     def __init__(self, models_dir: str | Path = "models/mediapipe", num_hands: int = 2):
         self._models_dir = Path(models_dir)
@@ -45,18 +45,26 @@ class MediaPipeCompositeAdapter(LandmarkExtractor):
         self._last_origin: np.ndarray | None = None
         self._last_shoulder_width: float | None = None
         self._smoothed_shoulder_width: float | None = None
+        # One Euro Filter on raw hand landmarks (applied before normalization)
+        self._hand_smoother = LandmarkSmoother(
+            frequency=30.0, min_cutoff=0.05, beta=40.0, derivate_cutoff=1.0
+        )
 
     def open(self) -> None:
         hand_model = str(self._models_dir / "hand_landmarker.task")
         pose_model = str(self._models_dir / "pose_landmarker_lite.task")
         face_model = str(self._models_dir / "face_landmarker.task")
 
+        # VIDEO mode enables frame-to-frame tracking (reuses bounding boxes
+        # between frames instead of running palm detection every frame).
+        # Asymmetric thresholds: tight detection (0.5) to avoid phantom hands,
+        # loose presence/tracking (0.3) to maintain continuity during fast signing.
         self._hand_landmarker = HandLandmarker.create_from_options(
             HandLandmarkerOptions(
                 base_options=BaseOptions(model_asset_path=hand_model),
-                running_mode=VisionRunningMode.IMAGE,
+                running_mode=VisionRunningMode.VIDEO,
                 num_hands=self._num_hands,
-                min_hand_detection_confidence=0.3,
+                min_hand_detection_confidence=0.5,
                 min_hand_presence_confidence=0.3,
                 min_tracking_confidence=0.3,
             )
@@ -64,16 +72,16 @@ class MediaPipeCompositeAdapter(LandmarkExtractor):
         self._pose_landmarker = PoseLandmarker.create_from_options(
             PoseLandmarkerOptions(
                 base_options=BaseOptions(model_asset_path=pose_model),
-                running_mode=VisionRunningMode.IMAGE,
+                running_mode=VisionRunningMode.VIDEO,
             )
         )
         self._face_landmarker = FaceLandmarker.create_from_options(
             FaceLandmarkerOptions(
                 base_options=BaseOptions(model_asset_path=face_model),
-                running_mode=VisionRunningMode.IMAGE,
+                running_mode=VisionRunningMode.VIDEO,
             )
         )
-        log.info("MediaPipe landmarkers initialized from %s", self._models_dir)
+        log.info("MediaPipe landmarkers initialized (VIDEO mode) from %s", self._models_dir)
 
     def close(self) -> None:
         for lm in [self._hand_landmarker, self._pose_landmarker, self._face_landmarker]:
@@ -85,29 +93,32 @@ class MediaPipeCompositeAdapter(LandmarkExtractor):
             return None
 
         start = time.perf_counter()
+        self._frame_count += 1
+        timestamp_ms = int(self._frame_count * (1000 / 30))
 
-        # OpenCV captures BGR; MediaPipe expects RGB
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
 
-        hand_result = self._hand_landmarker.detect(mp_image)
-        pose_result = self._pose_landmarker.detect(mp_image)
-        face_result = self._face_landmarker.detect(mp_image)
+        # VIDEO mode requires monotonically increasing timestamps
+        hand_result = self._hand_landmarker.detect_for_video(mp_image, timestamp_ms)
+        pose_result = self._pose_landmarker.detect_for_video(mp_image, timestamp_ms)
+        face_result = self._face_landmarker.detect_for_video(mp_image, timestamp_ms)
 
         self._last_latency_ms = (time.perf_counter() - start) * 1000
-        self._frame_count += 1
 
-        # Parse hands (raw MediaPipe [0,1] coords)
+        # Parse hands
         left_hand = None
         right_hand = None
         for i, handedness_list in enumerate(hand_result.handedness):
             label = handedness_list[0].category_name
             pts = _landmarks_to_array(hand_result.hand_landmarks[i])
-            # MediaPipe mirrors: "Left" in result = signer's right hand
             if label == "Left":
                 right_hand = pts
             else:
                 left_hand = pts
+
+        # Apply One Euro smoothing to raw landmarks before anything else
+        left_hand, right_hand = self._hand_smoother.smooth(left_hand, right_hand)
 
         # Parse pose
         if pose_result.pose_landmarks:
@@ -121,16 +132,13 @@ class MediaPipeCompositeAdapter(LandmarkExtractor):
         else:
             face_pts = np.zeros((FACE_LANDMARK_COUNT, 3), dtype=np.float32)
 
-        # Keep raw hand coords for display before normalization
         raw_hands = HandLandmarks(left=left_hand, right=right_hand)
 
-        # Normalize all landmarks to signing space
         norm_result = self._normalize(left_hand, right_hand, pose_pts, face_pts)
         if norm_result is None:
             return None
 
         norm_hands, norm_pose, norm_face = norm_result
-        timestamp_ms = int(self._frame_count * (1000 / 30))
 
         return LandmarkFrame(
             timestamp_ms=timestamp_ms,
@@ -148,10 +156,7 @@ class MediaPipeCompositeAdapter(LandmarkExtractor):
         pose: np.ndarray,
         face: np.ndarray,
     ) -> tuple[HandLandmarks, np.ndarray, np.ndarray] | None:
-        """Normalize to signing space: origin=sternum, scale=shoulder width.
-
-        Shoulder width is smoothed with an EMA to prevent jittery normalization.
-        """
+        """Normalize to signing space with EMA-smoothed shoulder width."""
         left_shoulder = pose[11]
         right_shoulder = pose[12]
         raw_width = float(np.linalg.norm(left_shoulder - right_shoulder))
@@ -160,7 +165,6 @@ class MediaPipeCompositeAdapter(LandmarkExtractor):
             origin = (left_shoulder + right_shoulder) / 2
             self._last_origin = origin
 
-            # EMA smoothing on shoulder width
             if self._smoothed_shoulder_width is None:
                 self._smoothed_shoulder_width = raw_width
             else:
