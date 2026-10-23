@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import time
+from pathlib import Path
 
 import mediapipe as mp
 import numpy as np
@@ -29,7 +30,8 @@ def _landmarks_to_array(landmark_list: list) -> np.ndarray:
 class MediaPipeCompositeAdapter(LandmarkExtractor):
     """Runs Hand, Pose, and Face Landmarkers and merges results into a LandmarkFrame."""
 
-    def __init__(self, num_hands: int = 2):
+    def __init__(self, models_dir: str | Path = "models/mediapipe", num_hands: int = 2):
+        self._models_dir = Path(models_dir)
         self._num_hands = num_hands
         self._hand_landmarker: HandLandmarker | None = None
         self._pose_landmarker: PoseLandmarker | None = None
@@ -38,26 +40,30 @@ class MediaPipeCompositeAdapter(LandmarkExtractor):
         self._frame_count = 0
 
     def open(self) -> None:
+        hand_model = str(self._models_dir / "hand_landmarker.task")
+        pose_model = str(self._models_dir / "pose_landmarker_lite.task")
+        face_model = str(self._models_dir / "face_landmarker.task")
+
         self._hand_landmarker = HandLandmarker.create_from_options(
             HandLandmarkerOptions(
-                base_options=BaseOptions(model_asset_path=None),
+                base_options=BaseOptions(model_asset_path=hand_model),
                 running_mode=VisionRunningMode.IMAGE,
                 num_hands=self._num_hands,
             )
         )
         self._pose_landmarker = PoseLandmarker.create_from_options(
             PoseLandmarkerOptions(
-                base_options=BaseOptions(model_asset_path=None),
+                base_options=BaseOptions(model_asset_path=pose_model),
                 running_mode=VisionRunningMode.IMAGE,
             )
         )
         self._face_landmarker = FaceLandmarker.create_from_options(
             FaceLandmarkerOptions(
-                base_options=BaseOptions(model_asset_path=None),
+                base_options=BaseOptions(model_asset_path=face_model),
                 running_mode=VisionRunningMode.IMAGE,
             )
         )
-        log.info("MediaPipe landmarkers initialized")
+        log.info("MediaPipe landmarkers initialized from %s", self._models_dir)
 
     def close(self) -> None:
         for lm in [self._hand_landmarker, self._pose_landmarker, self._face_landmarker]:
