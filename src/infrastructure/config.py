@@ -17,9 +17,16 @@ class PipelineConfig(BaseModel):
     max_queue_size: int = 3
 
 
+class DiagnosticsConfig(BaseModel):
+    enabled: bool = False
+    output_dir: str = "sessions"
+    snapshot_interval: int = 30
+
+
 class AppConfig(BaseModel):
     camera: CameraConfig = CameraConfig()
     pipeline: PipelineConfig = PipelineConfig()
+    diagnostics: DiagnosticsConfig = DiagnosticsConfig()
     show_overlay: bool = True
 
 

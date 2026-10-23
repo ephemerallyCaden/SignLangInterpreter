@@ -38,5 +38,8 @@ Thumbs.db
 # Jupyter
 .ipynb_checkpoints/
 
+# Session recordings
+sessions/
+
 # Claude Code
 .claude/

@@ -171,3 +171,7 @@ class MediaPipeCompositeAdapter(LandmarkExtractor):
 
     def get_latency_ms(self) -> float:
         return self._last_latency_ms
+
+    @property
+    def last_shoulder_width(self) -> float | None:
+        return self._last_shoulder_width
