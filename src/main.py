@@ -16,6 +16,7 @@ from src.adapters.transformer_rules import RuleBasedAdapter
 from src.core.orchestrator import TranslationOrchestrator
 from src.infrastructure.config import load_config
 from src.infrastructure.diagnostics import SessionRecorder
+from src.infrastructure.smoothing import HandPresenceSmoother
 
 log = logging.getLogger(__name__)
 
@@ -38,6 +39,7 @@ def main() -> None:
         camera = CameraOpenCVAdapter(config.camera.index)
 
     extractor = MediaPipeCompositeAdapter()
+    smoother = HandPresenceSmoother()
     classifier = LookupTableAdapter()
     transformer = RuleBasedAdapter()
     console = ConsoleOutputAdapter()
@@ -75,6 +77,7 @@ def main() -> None:
             result = None
 
             if landmarks is not None:
+                landmarks = smoother.smooth(landmarks)
                 overlay.set_landmarks(landmarks)
                 result = orchestrator.process_frame(landmarks)
                 if result is not None:

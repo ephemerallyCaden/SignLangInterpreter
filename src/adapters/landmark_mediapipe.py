@@ -4,6 +4,7 @@ import logging
 import time
 from pathlib import Path
 
+import cv2
 import mediapipe as mp
 import numpy as np
 
@@ -22,6 +23,7 @@ FaceLandmarker = mp.tasks.vision.FaceLandmarker
 VisionRunningMode = mp.tasks.vision.RunningMode
 
 FACE_LANDMARK_COUNT = 478  # 468 mesh + 10 iris
+SHOULDER_WIDTH_SMOOTHING = 0.7  # EMA alpha: higher = more smoothing
 
 
 def _landmarks_to_array(landmark_list: list) -> np.ndarray:
@@ -42,6 +44,7 @@ class MediaPipeCompositeAdapter(LandmarkExtractor):
         self._frame_count = 0
         self._last_origin: np.ndarray | None = None
         self._last_shoulder_width: float | None = None
+        self._smoothed_shoulder_width: float | None = None
 
     def open(self) -> None:
         hand_model = str(self._models_dir / "hand_landmarker.task")
@@ -53,6 +56,9 @@ class MediaPipeCompositeAdapter(LandmarkExtractor):
                 base_options=BaseOptions(model_asset_path=hand_model),
                 running_mode=VisionRunningMode.IMAGE,
                 num_hands=self._num_hands,
+                min_hand_detection_confidence=0.3,
+                min_hand_presence_confidence=0.3,
+                min_tracking_confidence=0.3,
             )
         )
         self._pose_landmarker = PoseLandmarker.create_from_options(
@@ -79,7 +85,10 @@ class MediaPipeCompositeAdapter(LandmarkExtractor):
             return None
 
         start = time.perf_counter()
-        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=frame)
+
+        # OpenCV captures BGR; MediaPipe expects RGB
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
 
         hand_result = self._hand_landmarker.detect(mp_image)
         pose_result = self._pose_landmarker.detect(mp_image)
@@ -118,7 +127,7 @@ class MediaPipeCompositeAdapter(LandmarkExtractor):
         # Normalize all landmarks to signing space
         norm_result = self._normalize(left_hand, right_hand, pose_pts, face_pts)
         if norm_result is None:
-            return None  # skip frame if pose detection failed entirely
+            return None
 
         norm_hands, norm_pose, norm_face = norm_result
         timestamp_ms = int(self._frame_count * (1000 / 30))
@@ -141,23 +150,31 @@ class MediaPipeCompositeAdapter(LandmarkExtractor):
     ) -> tuple[HandLandmarks, np.ndarray, np.ndarray] | None:
         """Normalize to signing space: origin=sternum, scale=shoulder width.
 
-        All landmarks (hands, pose, face) are transformed to the same space.
-        When pose detection fails, carries forward the last known good reference.
-        Returns None only if no valid reference has ever been established.
+        Shoulder width is smoothed with an EMA to prevent jittery normalization.
         """
         left_shoulder = pose[11]
         right_shoulder = pose[12]
-        shoulder_width = float(np.linalg.norm(left_shoulder - right_shoulder))
+        raw_width = float(np.linalg.norm(left_shoulder - right_shoulder))
 
-        if shoulder_width > 1e-6:
+        if raw_width > 1e-6:
             origin = (left_shoulder + right_shoulder) / 2
             self._last_origin = origin
-            self._last_shoulder_width = shoulder_width
+
+            # EMA smoothing on shoulder width
+            if self._smoothed_shoulder_width is None:
+                self._smoothed_shoulder_width = raw_width
+            else:
+                alpha = SHOULDER_WIDTH_SMOOTHING
+                self._smoothed_shoulder_width = (
+                    alpha * self._smoothed_shoulder_width + (1 - alpha) * raw_width
+                )
+            self._last_shoulder_width = self._smoothed_shoulder_width
+            shoulder_width = self._smoothed_shoulder_width
         elif self._last_origin is not None:
             origin = self._last_origin
             shoulder_width = self._last_shoulder_width  # type: ignore[assignment]
         else:
-            return None  # no valid pose reference yet
+            return None
 
         def shift_and_scale(pts: np.ndarray) -> np.ndarray:
             return (pts - origin) / shoulder_width
